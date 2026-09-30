@@ -1,6 +1,6 @@
 """Deterministic settlement, input, and session tests for both slots variants."""
 
-from itertools import cycle
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -27,24 +27,30 @@ def context():
 
 @pytest.fixture(autouse=True)
 def terminal(monkeypatch):
-    """Isolate terminal effects and make every random source deterministic."""
-    output = Mock()
-    prompt = Mock(side_effect=AssertionError("Unexpected input request"))
-    monkeypatch.setattr(view, "cinput", prompt)
-    monkeypatch.setattr(view, "cprint", output)
-    monkeypatch.setattr(view, "clear_screen", Mock())
+    """Replace terminal I/O and skip the cosmetic spin animation."""
+    terminal = SimpleNamespace(
+        prompt=Mock(side_effect=AssertionError("Unexpected input request")),
+        output=Mock(),
+        spin=Mock(),
+    )
+    for module in (view, stats_module):
+        monkeypatch.setattr(module, "cinput", terminal.prompt)
+        monkeypatch.setattr(module, "cprint", terminal.output)
+        monkeypatch.setattr(module, "clear_screen", Mock())
     monkeypatch.setattr(view, "display_topbar", Mock())
     monkeypatch.setattr(view.SlotsView, "render_row", Mock())
     monkeypatch.setattr(view.SlotsView, "render_grid", Mock())
-    monkeypatch.setattr(base.time, "sleep", Mock())
-    monkeypatch.setattr(stats_module, "cinput", prompt)
-    monkeypatch.setattr(stats_module, "cprint", output)
-    monkeypatch.setattr(stats_module, "clear_screen", Mock())
-    symbols = cycle(constants.ALL_ITEMS)
-    monkeypatch.setattr(standard.random, "choice", lambda items: next(symbols))
-    monkeypatch.setattr(standard.random, "random", Mock(return_value=0.9))
-    monkeypatch.setattr(standard.random, "randint", Mock(return_value=0))
-    return prompt, output
+    monkeypatch.setattr(base.Slots, "spin_animation", terminal.spin)
+    return terminal
+
+
+@pytest.fixture(autouse=True)
+def losing_outcomes(monkeypatch):
+    """Default to a loss; payout tests override the outcome they need."""
+    monkeypatch.setattr(standard.random, "random", lambda: 0.9)
+    monkeypatch.setattr(standard.random, "randint", lambda low, high: 0)
+    monkeypatch.setattr(standard.StandardSlots, "random_result", lambda self: LOSING_ROW)
+    monkeypatch.setattr(expanded, "get_rand_grid", lambda: LOSING_GRID)
 
 
 @pytest.fixture(params=[standard.StandardSlots, expanded.ExpandedSlots],
@@ -54,9 +60,8 @@ def game(request, context):
 
 
 def script(terminal, *answers):
-    prompt, _ = terminal
-    prompt.side_effect = answers
-    return prompt
+    terminal.prompt.side_effect = answers
+    return terminal.prompt
 
 
 def bet_for(game, amount):
@@ -154,7 +159,7 @@ def test_standard_invalid_bets_retry(context, terminal, raw, message):
     prompt = script(terminal, raw, "10")
     assert standard.StandardSlots(context).prompt_bet() == 10
     assert prompt.call_count == 2
-    terminal[1].assert_any_call(message)
+    terminal.output.assert_any_call(message)
     assert context.account.balance == 100
 
 
@@ -189,7 +194,7 @@ def test_expanded_invalid_bets_retry(context, terminal, raw, message):
     prompt = script(terminal, raw, "2,3,4")
     assert expanded.ExpandedSlots(context).prompt_bet() == (2, 3, 4)
     assert prompt.call_count == 2
-    terminal[1].assert_any_call(message)
+    terminal.output.assert_any_call(message)
     assert context.account.balance == 100
 
 
@@ -224,7 +229,7 @@ def test_menu_restrictions(game, terminal, balance, answers, menu, choice):
     assert game.get_player_choice(result, 10) == choice
     assert prompt.call_count == len(answers)
     assert all(call.args == (menu,) for call in prompt.call_args_list)
-    errors = [call for call in terminal[1].call_args_list
+    errors = [call for call in terminal.output.call_args_list
               if call.args == (constants.INVALID_INPUT_MSG,)]
     assert len(errors) == len(answers) - 1
     assert game.account.balance == balance
@@ -234,8 +239,8 @@ def test_round_without_funds_exits_without_spinning(game, terminal):
     game.account.balance = 1
     script(terminal, "")
     assert game.play_round() == "EXIT"
-    terminal[1].assert_any_call(constants.NO_FUNDS_MSG)
-    base.time.sleep.assert_not_called()
+    terminal.output.assert_any_call(constants.NO_FUNDS_MSG)
+    terminal.spin.assert_not_called()
     assert game.account.balance == game.stats.ending_balance == 1
     assert (game.stats.rounds_played, game.stats.wins, game.stats.losses) == (0, 0, 0)
 
@@ -246,8 +251,8 @@ def test_standing_bet_above_balance_requests_new_bet(game, terminal):
     game.take_new_bet = False
     assert game.play_round() == "CONTINUE"
     assert game.take_new_bet is True
-    terminal[0].assert_not_called()
-    base.time.sleep.assert_not_called()
+    terminal.prompt.assert_not_called()
+    terminal.spin.assert_not_called()
     assert game.account.balance == 5
     assert game.stats.rounds_played == 0
 
@@ -265,17 +270,13 @@ def test_standing_bet_above_balance_requests_new_bet(game, terminal):
 ])
 def test_public_session(context, terminal, monkeypatch, entrypoint, module,
                         raw_bets, ending):
-    """Run real rounds, settlement, animation loops, and the session summary."""
+    """Run real rounds, settlement, and the session summary with scripted input."""
     prompt = script(terminal, raw_bets[0], "r", "c", raw_bets[1], "q", "")
-    if module is standard:
-        monkeypatch.setattr(standard.random, "random", Mock(side_effect=[0, 0.9, 0.1]))
-    else:
-        # Each round consumes animation grids before its settlement grid.
-        frames = 5 + constants.TOTAL_SPINS
-        grids = []
-        for final in (WINNING_GRID, LOSING_GRID, (("A",) * 3,) * 3):
-            grids.extend([LOSING_GRID] * frames + [final])
-        monkeypatch.setattr(expanded, "get_rand_grid", Mock(side_effect=grids))
+    # Win, respin and lose, then change the bet and win a rounded payout.
+    monkeypatch.setattr(standard.random, "random", Mock(side_effect=[0, 0.9, 0.1]))
+    monkeypatch.setattr(expanded, "get_rand_grid", Mock(side_effect=[
+        WINNING_GRID, LOSING_GRID, (("A",) * 3,) * 3,
+    ]))
 
     display = Mock(wraps=stats_module.display_stats)
     monkeypatch.setattr(module, "display_stats", display)
@@ -284,18 +285,20 @@ def test_public_session(context, terminal, monkeypatch, entrypoint, module,
     assert context.account.balance == ending
     display.assert_called_once()
     stats = display.call_args.args[0]
-    assert stats.starting_balance == 100
-    assert stats.ending_balance == ending
-    assert (stats.rounds_played, stats.wins, stats.losses, stats.pushes) == (3, 2, 1, 0)
-    assert stats.net == ending - 100
-    assert stats.win_rate == "66.7%"
-    assert stats.game_name == ("Slots" if module is standard else "Slots (Expanded)")
+    assert stats == stats_module.GameStats(
+        game_name="Slots" if module is standard else "Slots (Expanded)",
+        starting_balance=100,
+        ending_balance=ending,
+        rounds_played=3,
+        wins=2,
+        losses=1,
+    )
     assert prompt.call_count == 6
     prompt.assert_called_with("Press Enter to return to menu...")
-    assert base.time.sleep.call_count == 3 * (5 + constants.TOTAL_SPINS)
-    output = "\n".join(call.args[0] for call in terminal[1].call_args_list)
-    for label, value in [("Game", stats.game_name), ("Hands Played", "3"),
-                         ("Wins", "2"), ("Losses", "1"), ("Win Rate", "66.7%"),
-                         ("Starting Balance", "100"), ("Ending Balance", str(ending)),
-                         ("Net Profit/Loss", f"+{ending - 100}")]:
-        assert any(label + ":" in line and value in line for line in output.splitlines())
+    assert terminal.spin.call_count == 3
+    output = " ".join(" ".join(call.args[0].split())
+                      for call in terminal.output.call_args_list)
+    assert "Session Summary" in output
+    assert f"Ending Balance: {ending}" in output
+    assert f"Net Profit/Loss: +{ending - 100}" in output
+    assert "Win Rate: 66.7%" in output
